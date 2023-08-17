@@ -113,7 +113,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			if ws.limiter != nil {
 				// NOTE: Wait will throttle the requests.
 				// To reject requests exceeding the limit, use if !ws.limiter.Allow()
-				if err := ws.limiter.Wait(context.Background()); err != nil {
+				if err := ws.limiter.Wait(context.TODO()); err != nil {
 					s.Log.Warningf("unexpected limiter error %v", err)
 					continue
 				}
@@ -125,7 +125,8 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			}
 
 			go func(message []byte) {
-				ctx = context.Background()
+				ctx = context.TODO()
+
 				var notice string
 				defer func() {
 					if notice != "" {
@@ -376,7 +377,11 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 
 		for {
 			select {
-			case <-ticker.C:
+			case _, ok := <-ticker.C:
+				if !ok {
+					return
+				}
+				conn.SetWriteDeadline(time.Now().Add(writeWait))
 				err := ws.WriteMessage(websocket.PingMessage, nil)
 				if err != nil {
 					s.Log.Errorf("error writing ping: %v; closing websocket", err)

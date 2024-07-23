@@ -348,9 +348,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		s.Log.Errorf("failed to upgrade websocket: %v", err)
 		return
 	}
-	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
-	s.clients[conn] = struct{}{}
+	s.clients.LoadOrStore(conn, struct{}{})
 	ticker := time.NewTicker(pingPeriod)
 
 	ip := conn.RemoteAddr().String()
@@ -379,13 +377,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			cancel()
 			ticker.Stop()
-			s.clientsMu.Lock()
-			if _, ok := s.clients[conn]; ok {
-				conn.Close()
-				delete(s.clients, conn)
-				removeListener(ws)
-			}
-			s.clientsMu.Unlock()
+			conn.Close()
+			s.clients.LoadAndDelete(conn)
+			removeListener(ws)
 			s.Log.Infof("disconnected from %s", ip)
 		}()
 

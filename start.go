@@ -41,8 +41,7 @@ type Server struct {
 	relay Relay
 
 	// keep a connection reference to all connected clients for Server.Shutdown
-	clientsMu sync.Mutex
-	clients   map[*websocket.Conn]struct{}
+	clients sync.Map
 
 	// in case you call Server.Start
 	Addr       string
@@ -65,7 +64,6 @@ func NewServer(relay Relay, opts ...Option) (*Server, error) {
 	srv := &Server{
 		Log:      defaultLogger(relay.Name() + ": "),
 		relay:    relay,
-		clients:  make(map[*websocket.Conn]struct{}),
 		serveMux: &http.ServeMux{},
 		options:  options,
 	}
@@ -142,13 +140,13 @@ func (s *Server) Start(host string, port int, started ...chan bool) error {
 func (s *Server) Shutdown(ctx context.Context) {
 	s.httpServer.Shutdown(ctx)
 
-	s.clientsMu.Lock()
-	defer s.clientsMu.Unlock()
-	for conn := range s.clients {
+	s.clients.Range(func(k, v any) bool {
+		conn := k.(*websocket.Conn)
 		conn.WriteControl(websocket.CloseMessage, nil, time.Now().Add(time.Second))
 		conn.Close()
-		delete(s.clients, conn)
-	}
+		s.clients.LoadAndDelete(conn)
+		return true
+	})
 
 	if f, ok := s.relay.(ShutdownAware); ok {
 		f.OnShutdown(ctx)

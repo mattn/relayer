@@ -40,21 +40,26 @@ func (r *Relay) Init() error {
 
 		for {
 			time.Sleep(60 * time.Minute)
-			db.DB.Exec(`DELETE FROM event WHERE created_at < $1`, time.Now().AddDate(0, -3, 0).Unix()) // 3 months
+			db.DB.Exec(
+				`DELETE FROM event WHERE created_at < $1`,
+				time.Now().AddDate(0, -3, 0).Unix(),
+			) // 3 months
 		}
 	}()
 
 	return nil
 }
 
-func (r *Relay) AcceptEvent(ctx context.Context, evt *nostr.Event) bool {
+func (r *Relay) AcceptEvent(ctx context.Context, evt *nostr.Event) (
+	bool, string,
+) {
 	// block events that are too large
 	jsonb, _ := json.Marshal(evt)
 	if len(jsonb) > 10000 {
-		return false
+		return false, "event is too large"
 	}
 
-	return true
+	return true, ""
 }
 
 func main() {

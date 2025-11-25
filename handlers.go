@@ -205,6 +205,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 								receivers, _ := filter.Tags["p"]
 								switch {
 								case ws.authed == "":
+									ws.WriteJSON([]interface{}{"EOSE", id})
 									// not authenticated
 									notice = "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
 									return
@@ -213,6 +214,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, r *http.Request) {
 								case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
 									// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
 								default:
+									ws.WriteJSON([]interface{}{"EOSE", id})
 									// restricted filter: do not return any events,
 									//   even if other elements in filters array were not restricted).
 									//   client should know better.

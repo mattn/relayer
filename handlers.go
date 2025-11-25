@@ -205,14 +205,22 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			filterReq,
 			&filters[i],
 		); err != nil {
-			return "failed to decode filter"
+			ws.WriteJSON(nostr.ClosedEnvelope{
+				SubscriptionID: id,
+				Reason:         "failed to decode filter",
+			})
+			return ""
 		}
 	}
 
 	if accepter, ok := s.relay.(ReqAccepter); ok {
 		if !accepter.AcceptReq(ctx, id, filters, ws.authed) {
 			ws.WriteJSON(nostr.EOSEEnvelope(id))
-			return "REQ filters are not accepted"
+			ws.WriteJSON(nostr.ClosedEnvelope{
+				SubscriptionID: id,
+				Reason:         "REQ filters are not accepted",
+			})
+			return ""
 		}
 	}
 

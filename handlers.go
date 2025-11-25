@@ -226,19 +226,24 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				receivers, _ := filter.Tags["p"]
 				switch {
 				case ws.authed == "":
-					ws.WriteJSON(nostr.EOSEEnvelope(id))
-					// not authenticated
-					return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
+					ws.WriteJSON(nostr.ClosedEnvelope{
+						SubscriptionID: id,
+						Reason:         "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?",
+					})
+					return ""
 				case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
 					// allowed filter: ws.authed is sole sender (filter specifies one or all receivers)
 				case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
 					// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
 				default:
-					ws.WriteJSON(nostr.EOSEEnvelope(id))
 					// restricted filter: do not return any events,
 					//   even if other elements in filters array were not restricted).
 					//   client should know better.
-					return "restricted: authenticated user does not have authorization for requested filters."
+					ws.WriteJSON(nostr.ClosedEnvelope{
+						SubscriptionID: id,
+						Reason:         "restricted: authenticated user does not have authorization for requested filters.",
+					})
+					return ""
 				}
 			}
 		}

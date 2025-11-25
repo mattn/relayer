@@ -211,6 +211,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 	if accepter, ok := s.relay.(ReqAccepter); ok {
 		if !accepter.AcceptReq(ctx, id, filters, ws.authed) {
+			ws.WriteJSON(nostr.EOSEEnvelope(id))
 			return "REQ filters are not accepted"
 		}
 	}
@@ -225,6 +226,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				receivers, _ := filter.Tags["p"]
 				switch {
 				case ws.authed == "":
+					ws.WriteJSON(nostr.EOSEEnvelope(id))
 					// not authenticated
 					return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
 				case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
@@ -232,6 +234,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
 					// allowed filter: ws.authed is sole receiver (filter specifies one or all senders)
 				default:
+					ws.WriteJSON(nostr.EOSEEnvelope(id))
 					// restricted filter: do not return any events,
 					//   even if other elements in filters array were not restricted).
 					//   client should know better.

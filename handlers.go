@@ -205,13 +205,22 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			filterReq,
 			&filters[i],
 		); err != nil {
-			return "failed to decode filter"
+			ws.WriteJSON(nostr.ClosedEnvelope{
+				SubscriptionID: id,
+				Reason:         "failed to decode filter",
+			})
+			return ""
 		}
 	}
 
 	if accepter, ok := s.relay.(ReqAccepter); ok {
 		if !accepter.AcceptReq(ctx, id, filters, ws.authed) {
-			return "REQ filters are not accepted"
+			ws.WriteJSON(nostr.EOSEEnvelope(id))
+			ws.WriteJSON(nostr.ClosedEnvelope{
+				SubscriptionID: id,
+				Reason:         "REQ filters are not accepted",
+			})
+			return ""
 		}
 	}
 
@@ -225,8 +234,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				receivers, _ := filter.Tags["p"]
 				switch {
 				case ws.authed == "":
-					// not authenticated
-					return "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?"
+					ws.WriteJSON(nostr.ClosedEnvelope{
+						SubscriptionID: id,
+						Reason:         "restricted: this relay does not serve kind-4 to unauthenticated users, does your client implement NIP-42?",
+					})
+					return ""
 				case len(senders) == 1 && len(receivers) < 2 && (senders[0] == ws.authed):
 					// allowed filter: ws.authed is sole sender (filter specifies one or all receivers)
 				case len(receivers) == 1 && len(senders) < 2 && (receivers[0] == ws.authed):
@@ -235,7 +247,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 					// restricted filter: do not return any events,
 					//   even if other elements in filters array were not restricted).
 					//   client should know better.
-					return "restricted: authenticated user does not have authorization for requested filters."
+					ws.WriteJSON(nostr.ClosedEnvelope{
+						SubscriptionID: id,
+						Reason:         "restricted: authenticated user does not have authorization for requested filters.",
+					})
+					return ""
 				}
 			}
 		}

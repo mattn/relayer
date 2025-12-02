@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/fasthttp/websocket"
@@ -359,6 +360,13 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 			notice = "unknown message type " + typ
 		}
 	}
+
+	// NIP-42 auth challenge
+	if strings.HasPrefix(notice, "auth-required:") {
+		if _, ok := s.relay.(Auther); ok {
+			ws.WriteJSON(nostr.AuthEnvelope{Challenge: &ws.challenge})
+		}
+	}
 }
 
 func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
@@ -414,11 +422,6 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			conn.SetReadDeadline(time.Now().Add(pongWait))
 			return nil
 		})
-
-		// NIP-42 auth challenge
-		if _, ok := s.relay.(Auther); ok {
-			ws.WriteJSON(nostr.AuthEnvelope{Challenge: &ws.challenge})
-		}
 
 		for {
 			typ, message, err := conn.ReadMessage()

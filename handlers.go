@@ -107,7 +107,12 @@ func (s *Server) doEvent(ctx context.Context, ws *WebSocket, request []json.RawM
 				}
 
 				// check if this can be deleted
-				if target.PubKey != evt.PubKey {
+				if target.Kind == nostr.KindGiftWrap {
+					if !target.Tags.ContainsAny("p", []string{evt.PubKey}) {
+						ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "only the recipient can delete gift-wrapped"})
+						return ""
+					}
+				} else if target.PubKey != evt.PubKey {
 					ws.WriteJSON(nostr.OKEnvelope{EventID: evt.ID, OK: false, Reason: "insufficient permissions"})
 					return ""
 				}

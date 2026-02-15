@@ -280,7 +280,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				}
 				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
 				i++
-				if i > filter.Limit {
+				if i >= filter.Limit {
 					break
 				}
 			}

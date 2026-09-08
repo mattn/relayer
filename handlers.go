@@ -155,24 +155,38 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 		return "COUNT has no <id>"
 	}
 
-	total := int64(0)
 	filters := make(nostr.Filters, len(request)-2)
 	for i, filterReq := range request[2:] {
 		if err := json.Unmarshal(filterReq, &filters[i]); err != nil {
 			return "failed to decode filter"
 		}
 
-		filter := filters[i]
-		if reason := s.validateFilterAccess(ws, filter, false); reason != "" {
+		if reason := s.validateFilterAccess(ws, filters[i], false); reason != "" {
 			return reason
 		}
+	}
 
-		count, err := counter.CountEvents(ctx, filter)
+	total := int64(0)
+	// NIP-45 OR's the filters together into a single count, so an event
+	// matching more than one of them counts once. Only a store that can
+	// evaluate the union knows which events those are; without one the counts
+	// are summed, which is exact for filters that do not overlap.
+	if union, ok := store.(FiltersCounter); ok && len(filters) > 1 {
+		count, err := union.CountEventsFilters(ctx, filters)
 		if err != nil {
 			s.Log.Errorf("store: %v", err)
-			continue
+			return "error: failed to count events"
 		}
-		total += count
+		total = count
+	} else {
+		for _, filter := range filters {
+			count, err := counter.CountEvents(ctx, filter)
+			if err != nil {
+				s.Log.Errorf("store: %v", err)
+				continue
+			}
+			total += count
+		}
 	}
 
 	ws.WriteJSON([]interface{}{"COUNT", id, map[string]int64{"count": total}})

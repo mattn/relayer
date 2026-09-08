@@ -87,3 +87,14 @@ type AdvancedSaver interface {
 type EventCounter interface {
 	CountEvents(ctx context.Context, filter nostr.Filter) (int64, error)
 }
+
+// FiltersCounter counts the events matching any of several filters for NIP-45,
+// which asks for the filters to be OR'd together into a single count. Summing
+// CountEvents over each filter separately counts an event that matches more
+// than one of them once per filter, so a store that can evaluate the union
+// itself — a SQL backend counting over a UNION, say — should implement this.
+// Stores that do not are still summed, which is exact as long as the filters
+// do not overlap.
+type FiltersCounter interface {
+	CountEventsFilters(ctx context.Context, filters nostr.Filters) (int64, error)
+}

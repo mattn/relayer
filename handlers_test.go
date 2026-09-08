@@ -524,9 +524,139 @@ type testStorageWithCounter struct {
 	countEvents func(context.Context, nostr.Filter) (int64, error)
 }
 
+type testStorageWithFiltersCounter struct {
+	testStorageWithCounter
+	countEventsFilters func(context.Context, nostr.Filters) (int64, error)
+}
+
+func (s *testStorageWithFiltersCounter) CountEventsFilters(ctx context.Context, f nostr.Filters) (int64, error) {
+	if s.countEventsFilters != nil {
+		return s.countEventsFilters(ctx, f)
+	}
+	return 0, nil
+}
+
 func (s *testStorageWithCounter) CountEvents(ctx context.Context, f nostr.Filter) (int64, error) {
 	if s.countEvents != nil {
 		return s.countEvents(ctx, f)
 	}
 	return 0, nil
+}
+
+func TestDoCount_SumsFiltersWithoutAUnionCounter(t *testing.T) {
+	// A store that can only count one filter at a time is still summed: that
+	// is exact as long as the filters do not overlap.
+	calls := 0
+	st := &testStorageWithCounter{
+		testStorage: testStorage{},
+		countEvents: func(_ context.Context, _ nostr.Filter) (int64, error) {
+			calls++
+			return 3, nil
+		},
+	}
+	srv := startTestRelay(t, &testRelay{storage: st})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"COUNT", "c1",
+		nostr.Filter{Kinds: []int{1}}, nostr.Filter{Kinds: []int{7}}})
+
+	typ, raw := recvMessage(t, conn)
+	if typ != "COUNT" {
+		t.Fatalf("expected COUNT, got %s", typ)
+	}
+	var res struct {
+		Count int64 `json:"count"`
+	}
+	json.Unmarshal(raw[2], &res)
+	if res.Count != 6 {
+		t.Errorf("count = %d, want 6", res.Count)
+	}
+	if calls != 2 {
+		t.Errorf("CountEvents called %d times, want 2", calls)
+	}
+}
+
+func TestDoCount_UnionCounterSeesEveryFilter(t *testing.T) {
+	// NIP-45 OR's the filters together, so an event matching more than one of
+	// them counts once. A store that can evaluate the union is handed all the
+	// filters at once instead of being asked about them one by one.
+	var got nostr.Filters
+	perFilterCalls := 0
+	st := &testStorageWithFiltersCounter{
+		testStorageWithCounter: testStorageWithCounter{
+			testStorage: testStorage{},
+			countEvents: func(_ context.Context, _ nostr.Filter) (int64, error) {
+				perFilterCalls++
+				return 3, nil
+			},
+		},
+		countEventsFilters: func(_ context.Context, f nostr.Filters) (int64, error) {
+			got = f
+			return 4, nil
+		},
+	}
+	srv := startTestRelay(t, &testRelay{storage: st})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"COUNT", "c1",
+		nostr.Filter{Kinds: []int{1}}, nostr.Filter{Kinds: []int{1, 7}}})
+
+	typ, raw := recvMessage(t, conn)
+	if typ != "COUNT" {
+		t.Fatalf("expected COUNT, got %s", typ)
+	}
+	var res struct {
+		Count int64 `json:"count"`
+	}
+	json.Unmarshal(raw[2], &res)
+	if res.Count != 4 {
+		t.Errorf("count = %d, want 4 (the union, not the sum)", res.Count)
+	}
+	if len(got) != 2 {
+		t.Fatalf("union counter saw %d filters, want 2", len(got))
+	}
+	if perFilterCalls != 0 {
+		t.Errorf("CountEvents called %d times, want 0", perFilterCalls)
+	}
+}
+
+func TestDoCount_SingleFilterUsesCountEvents(t *testing.T) {
+	// One filter cannot overlap with itself, so the union path is unnecessary.
+	unionCalls := 0
+	perFilterCalls := 0
+	st := &testStorageWithFiltersCounter{
+		testStorageWithCounter: testStorageWithCounter{
+			testStorage: testStorage{},
+			countEvents: func(_ context.Context, _ nostr.Filter) (int64, error) {
+				perFilterCalls++
+				return 5, nil
+			},
+		},
+		countEventsFilters: func(_ context.Context, _ nostr.Filters) (int64, error) {
+			unionCalls++
+			return 99, nil
+		},
+	}
+	srv := startTestRelay(t, &testRelay{storage: st})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"COUNT", "c1", nostr.Filter{Kinds: []int{1}}})
+
+	typ, raw := recvMessage(t, conn)
+	if typ != "COUNT" {
+		t.Fatalf("expected COUNT, got %s", typ)
+	}
+	var res struct {
+		Count int64 `json:"count"`
+	}
+	json.Unmarshal(raw[2], &res)
+	if res.Count != 5 {
+		t.Errorf("count = %d, want 5", res.Count)
+	}
+	if unionCalls != 0 || perFilterCalls != 1 {
+		t.Errorf("union=%d perFilter=%d, want 0 and 1", unionCalls, perFilterCalls)
+	}
 }

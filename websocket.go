@@ -11,6 +11,9 @@ type WebSocket struct {
 	conn  *websocket.Conn
 	mutex sync.Mutex
 
+	// Protected by Server.listenersMu. Disconnect permanently forbids new listeners.
+	disconnected bool
+
 	// nip42
 	challenge string
 	authed    string

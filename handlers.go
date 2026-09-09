@@ -430,9 +430,9 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 			if _, ok := s.clients[conn]; ok {
 				conn.Close()
 				delete(s.clients, conn)
-				s.removeListener(ws)
 			}
 			s.clientsMu.Unlock()
+			s.removeListener(ws)
 			s.Log.Infof("disconnected from %s", ip)
 		}()
 

@@ -3,6 +3,7 @@ package relayer
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -135,6 +136,43 @@ func TestRemoveListenerNonexistent(t *testing.T) {
 	srv := newListenerTestServer()
 	ws := &WebSocket{}
 	srv.removeListener(ws)
+}
+
+func TestLateRequestCannotRetainDisconnectedClient(t *testing.T) {
+	for _, hadSubscription := range []bool{false, true} {
+		srv := newListenerTestServer()
+		ws := &WebSocket{}
+		if hadSubscription {
+			srv.setListener("existing", ws, nostr.Filters{{Kinds: []int{1}}})
+		}
+		// A history query may finish after the reader's disconnect cleanup.
+		srv.removeListener(ws)
+		srv.setListener("late", ws, nostr.Filters{{Authors: []string{"retained-author"}}})
+		if totalConnections(srv) != 0 {
+			t.Errorf("late REQ retained disconnected client (existing subscription: %v)", hadSubscription)
+		}
+	}
+}
+
+func TestDisconnectRacingWithListenerRegistration(t *testing.T) {
+	srv := newListenerTestServer()
+	for range 1000 {
+		ws := &WebSocket{}
+		var workers sync.WaitGroup
+		workers.Add(2)
+		go func() {
+			defer workers.Done()
+			srv.setListener("late", ws, nostr.Filters{{Kinds: []int{1}}})
+		}()
+		go func() {
+			defer workers.Done()
+			srv.removeListener(ws)
+		}()
+		workers.Wait()
+	}
+	if n := totalConnections(srv); n != 0 {
+		t.Fatalf("retained %d disconnected clients", n)
+	}
 }
 
 func TestGetListeningFilters(t *testing.T) {

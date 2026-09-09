@@ -51,6 +51,9 @@ func appendDistinctFilters(dst nostr.Filters, src nostr.Filters) nostr.Filters {
 func (s *Server) setListener(id string, ws *WebSocket, filters nostr.Filters) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
+	if ws.disconnected {
+		return
+	}
 
 	subs, ok := s.listeners[ws]
 	if !ok {
@@ -78,6 +81,7 @@ func (s *Server) removeListenerId(ws *WebSocket, id string) {
 func (s *Server) removeListener(ws *WebSocket) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
+	ws.disconnected = true
 	clear(s.listeners[ws])
 	delete(s.listeners, ws)
 }

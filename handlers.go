@@ -193,11 +193,15 @@ func (s *Server) doCount(ctx context.Context, ws *WebSocket, request []json.RawM
 	return ""
 }
 
-func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store) string {
+func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store, req *subscriptionRequest) string {
 	var id string
 	json.Unmarshal(request[1], &id)
 	if id == "" {
 		return "REQ has no <id>"
+	}
+	defer s.finishRequest(ws, id, req)
+	if ctx.Err() != nil {
+		return ""
 	}
 
 	filters := make(nostr.Filters, len(request)-2)
@@ -215,7 +219,11 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	if accepter, ok := s.relay.(ReqAccepter); ok {
-		if !accepter.AcceptReq(ctx, id, filters, ws.authed) {
+		accepted := accepter.AcceptReq(ctx, id, filters, ws.authed)
+		if ctx.Err() != nil {
+			return ""
+		}
+		if !accepted {
 			ws.WriteJSON(nostr.EOSEEnvelope(id))
 			ws.WriteJSON(nostr.ClosedEnvelope{
 				SubscriptionID: id,
@@ -226,6 +234,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 	}
 
 	for _, filter := range filters {
+		if ctx.Err() != nil {
+			return ""
+		}
 		if reason := s.validateFilterAccess(ws, filter, true); reason != "" {
 			if strings.HasPrefix(reason, "auth-required:") {
 				s.sendAuthChallenge(ws)
@@ -242,6 +253,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 
 		events, err := store.QueryEvents(ctx, filter)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ""
+			}
 			s.Log.Errorf("store: %v", err)
 			continue
 		}
@@ -252,25 +266,44 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 		i := 0
 		if events != nil {
-			for event := range events {
+		readEvents:
+			for {
+				var event *nostr.Event
+				select {
+				case <-ctx.Done():
+					return ""
+				case next, ok := <-events:
+					if !ok {
+						break readEvents
+					}
+					event = next
+				}
+				if ctx.Err() != nil {
+					return ""
+				}
+				// Keep draining after the limit, in case storage returns extra
+				// events, but let cancellation stop an unfinished stream.
+				if i >= filter.Limit {
+					continue
+				}
 				if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
 					continue
 				}
-				ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event})
-				i++
-				if i >= filter.Limit {
-					break
+				if err := ws.WriteJSON(nostr.EventEnvelope{SubscriptionID: &id, Event: *event}); err != nil {
+					return ""
 				}
-			}
-
-			// exhaust the channel (in case we broke out of it early) so it is closed by the storage
-			for range events {
+				i++
 			}
 		}
 	}
 
-	ws.WriteJSON(nostr.EOSEEnvelope(id))
-	s.setListener(id, ws, filters)
+	if ctx.Err() != nil {
+		return ""
+	}
+	if err := ws.WriteJSON(nostr.EOSEEnvelope(id)); err != nil {
+		return ""
+	}
+	s.registerRequest(ws, id, req, filters)
 	return ""
 }
 
@@ -302,13 +335,6 @@ func (s *Server) doAuth(ctx context.Context, ws *WebSocket, request []json.RawMe
 }
 
 func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byte, store eventstore.Store) {
-	var notice string
-	defer func() {
-		if notice != "" {
-			ws.WriteJSON(nostr.NoticeEnvelope(notice))
-		}
-	}()
-
 	var request []json.RawMessage
 	if err := json.Unmarshal(message, &request); err != nil {
 		// stop silently
@@ -316,7 +342,7 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	}
 
 	if len(request) < 2 {
-		notice = "request has less than 2 parameters"
+		ws.WriteJSON(nostr.NoticeEnvelope("request has less than 2 parameters"))
 		return
 	}
 
@@ -326,15 +352,41 @@ func (s *Server) handleMessage(ctx context.Context, ws *WebSocket, message []byt
 	ctx = context.WithValue(ctx, AUTH_CONTEXT_KEY, ws)
 	ctx = context.WithValue(ctx, SERVER_CONTEXT_KEY, s)
 
+	// Reserve REQ tokens and process CLOSE in reader order, before starting
+	// workers. Ordering only inside doReq would still let a delayed worker
+	// start after its CLOSE or after a newer REQ with the same ID.
+	var req *subscriptionRequest
+	if typ == "REQ" {
+		var id string
+		json.Unmarshal(request[1], &id)
+		if id != "" {
+			req = s.beginRequest(ctx, ws, id)
+			ctx = req.ctx
+		}
+	} else if typ == "CLOSE" {
+		if notice := s.doClose(ctx, ws, request, store); notice != "" {
+			ws.WriteJSON(nostr.NoticeEnvelope(notice))
+		}
+		return
+	}
+	go s.handleParsedMessage(ctx, ws, request, store, typ, req)
+}
+
+func (s *Server) handleParsedMessage(ctx context.Context, ws *WebSocket, request []json.RawMessage, store eventstore.Store, typ string, req *subscriptionRequest) {
+	var notice string
+	defer func() {
+		if notice != "" {
+			ws.WriteJSON(nostr.NoticeEnvelope(notice))
+		}
+	}()
+
 	switch typ {
 	case "EVENT":
 		notice = s.doEvent(ctx, ws, request, store)
 	case "COUNT":
 		notice = s.doCount(ctx, ws, request, store)
 	case "REQ":
-		notice = s.doReq(ctx, ws, request, store)
-	case "CLOSE":
-		notice = s.doClose(ctx, ws, request, store)
+		notice = s.doReq(ctx, ws, request, store, req)
 	case "AUTH":
 		notice = s.doAuth(ctx, ws, request, store)
 	default:
@@ -471,7 +523,7 @@ func (s *Server) HandleWebsocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			go s.handleMessage(ctx, ws, message, store)
+			s.handleMessage(ctx, ws, message, store)
 		}
 	}()
 

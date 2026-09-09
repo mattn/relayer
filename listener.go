@@ -1,6 +1,59 @@
 package relayer
 
-import "github.com/nbd-wtf/go-nostr"
+import (
+	"context"
+
+	"github.com/nbd-wtf/go-nostr"
+)
+
+// Only in-flight requests are tracked. Removing an entry invalidates its
+// registration token, without retaining a tombstone for every closed ID.
+type subscriptionRequest struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (s *Server) beginRequest(ctx context.Context, ws *WebSocket, id string) *subscriptionRequest {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	req := &subscriptionRequest{ctx: ctx, cancel: cancel}
+	if ws.disconnected {
+		cancel()
+		return req
+	}
+	if old := ws.requests[id]; old != nil {
+		old.cancel()
+	}
+	if ws.requests == nil {
+		ws.requests = make(map[string]*subscriptionRequest)
+	}
+	ws.requests[id] = req
+	// A replacement stops the old live subscription immediately as well.
+	s.removeListenerIdLocked(ws, id)
+	return req
+}
+
+func (s *Server) finishRequest(ws *WebSocket, id string, req *subscriptionRequest) {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	if ws.requests[id] == req {
+		delete(ws.requests, id)
+		if len(ws.requests) == 0 {
+			ws.requests = nil
+		}
+	}
+	req.cancel()
+}
+
+func (s *Server) registerRequest(ws *WebSocket, id string, req *subscriptionRequest, filters nostr.Filters) {
+	s.listenersMu.Lock()
+	defer s.listenersMu.Unlock()
+	if ws.requests[id] != req || req.ctx.Err() != nil {
+		return
+	}
+	s.setListenerLocked(id, ws, filters)
+}
 
 type Listener struct {
 	filters nostr.Filters
@@ -51,6 +104,10 @@ func appendDistinctFilters(dst nostr.Filters, src nostr.Filters) nostr.Filters {
 func (s *Server) setListener(id string, ws *WebSocket, filters nostr.Filters) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
+	s.setListenerLocked(id, ws, filters)
+}
+
+func (s *Server) setListenerLocked(id string, ws *WebSocket, filters nostr.Filters) {
 	if ws.disconnected {
 		return
 	}
@@ -68,7 +125,17 @@ func (s *Server) setListener(id string, ws *WebSocket, filters nostr.Filters) {
 func (s *Server) removeListenerId(ws *WebSocket, id string) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
+	if req := ws.requests[id]; req != nil {
+		req.cancel()
+		delete(ws.requests, id)
+		if len(ws.requests) == 0 {
+			ws.requests = nil
+		}
+	}
+	s.removeListenerIdLocked(ws, id)
+}
 
+func (s *Server) removeListenerIdLocked(ws *WebSocket, id string) {
 	if subs, ok := s.listeners[ws]; ok {
 		delete(s.listeners[ws], id)
 		if len(subs) == 0 {
@@ -82,6 +149,10 @@ func (s *Server) removeListener(ws *WebSocket) {
 	s.listenersMu.Lock()
 	defer s.listenersMu.Unlock()
 	ws.disconnected = true
+	for _, req := range ws.requests {
+		req.cancel()
+	}
+	ws.requests = nil
 	clear(s.listeners[ws])
 	delete(s.listeners, ws)
 }

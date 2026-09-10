@@ -10,7 +10,12 @@ import (
 
 func startTestRelay(t *testing.T, tr *testRelay) *Server {
 	t.Helper()
-	srv, _ := NewServer(tr)
+	return startTestRelayWithOptions(t, tr)
+}
+
+func startTestRelayWithOptions(t *testing.T, tr *testRelay, opts ...Option) *Server {
+	t.Helper()
+	srv, _ := NewServer(tr, opts...)
 	started := make(chan bool)
 	go srv.Start("127.0.0.1", 0, started)
 	<-started

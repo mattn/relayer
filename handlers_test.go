@@ -660,3 +660,203 @@ func TestDoCount_SingleFilterUsesCountEvents(t *testing.T) {
 		t.Errorf("union=%d perFilter=%d, want 0 and 1", unionCalls, perFilterCalls)
 	}
 }
+
+// --- NIP-67 EOSE completeness hint tests ---
+
+// recvEOSE reads an EOSE envelope and returns the NIP-67 completeness hints
+// (nil when the relay sent a bare two-element EOSE).
+func recvEOSE(t *testing.T, conn *websocket.Conn) (subID string, hints []string) {
+	t.Helper()
+	typ, raw := recvMessage(t, conn)
+	if typ != "EOSE" {
+		t.Fatalf("expected EOSE, got %s", typ)
+	}
+	json.Unmarshal(raw[1], &subID)
+	if len(raw) > 2 {
+		json.Unmarshal(raw[2], &hints)
+	}
+	return
+}
+
+// TestDoReq_EOSEFinishHint: when the relay has drained every matching event it
+// must mark the EOSE with the NIP-67 "finish" hint.
+func TestDoReq_EOSEFinishHint(t *testing.T) {
+	srv := startTestRelay(t, &testRelay{storage: &slicestore.SliceStore{}})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sk := nostr.GeneratePrivateKey()
+
+	evt := signedEvent(sk, 1, "hello", nostr.Tags{})
+	sendJSON(t, conn, []interface{}{"EVENT", evt})
+	recvOK(t, conn)
+
+	sendJSON(t, conn, []interface{}{"REQ", "sub1", nostr.Filter{Kinds: []int{1}}})
+	typ, _ := recvMessage(t, conn)
+	if typ != "EVENT" {
+		t.Fatalf("expected EVENT, got %s", typ)
+	}
+	_, hints := recvEOSE(t, conn)
+	if len(hints) != 1 || hints[0] != "finish" {
+		t.Errorf("expected [finish] hint, got %v", hints)
+	}
+}
+
+// TestDoReq_EOSEFinishHintNoResults: an empty result set is still definitively
+// complete, so it carries the "finish" hint too.
+func TestDoReq_EOSEFinishHintNoResults(t *testing.T) {
+	srv := startTestRelay(t, &testRelay{storage: &slicestore.SliceStore{}})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"REQ", "sub1", nostr.Filter{Kinds: []int{99999}}})
+
+	_, hints := recvEOSE(t, conn)
+	if len(hints) != 1 || hints[0] != "finish" {
+		t.Errorf("expected [finish] hint, got %v", hints)
+	}
+}
+
+// TestDoReq_EOSEMoreHint: a storage that hands back more events than the filter
+// limit lets the relay prove there are leftovers, so the EOSE carries "more".
+func TestDoReq_EOSEMoreHint(t *testing.T) {
+	sk := nostr.GeneratePrivateKey()
+	st := &testStorage{
+		queryEvents: func(_ context.Context, _ nostr.Filter) (chan *nostr.Event, error) {
+			// ignore the limit and emit 3 events
+			ch := make(chan *nostr.Event, 3)
+			for i := 0; i < 3; i++ {
+				evt := signedEvent(sk, 1, "hello", nostr.Tags{})
+				ch <- &evt
+			}
+			close(ch)
+			return ch, nil
+		},
+	}
+	srv := startTestRelay(t, &testRelay{storage: st})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"REQ", "sub1", nostr.Filter{Kinds: []int{1}, Limit: 1}})
+
+	typ, _ := recvMessage(t, conn)
+	if typ != "EVENT" {
+		t.Fatalf("expected EVENT, got %s", typ)
+	}
+	_, hints := recvEOSE(t, conn)
+	if len(hints) != 1 || hints[0] != "more" {
+		t.Errorf("expected [more] hint, got %v", hints)
+	}
+}
+
+// TestDoReq_EOSENoHintWhenAmbiguous: when the storage returns exactly `limit`
+// events the relay cannot tell whether more exist (the storage may have capped
+// the query), so per NIP-67 it must stay silent rather than guess.
+func TestDoReq_EOSENoHintWhenAmbiguous(t *testing.T) {
+	srv := startTestRelay(t, &testRelay{storage: &slicestore.SliceStore{}})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sk := nostr.GeneratePrivateKey()
+
+	// publish 3 events but ask for only 1; slicestore caps the query at the limit
+	for i := 0; i < 3; i++ {
+		evt := signedEvent(sk, 1, "hello", nostr.Tags{})
+		sendJSON(t, conn, []interface{}{"EVENT", evt})
+		recvOK(t, conn)
+	}
+
+	sendJSON(t, conn, []interface{}{"REQ", "sub1", nostr.Filter{Kinds: []int{1}, Limit: 1}})
+	typ, _ := recvMessage(t, conn)
+	if typ != "EVENT" {
+		t.Fatalf("expected EVENT, got %s", typ)
+	}
+	_, hints := recvEOSE(t, conn)
+	if hints != nil {
+		t.Errorf("expected no hint (ambiguous), got %v", hints)
+	}
+}
+
+// TestDoReq_EOSENoHintWhenLimitZero: a limit-zero filter is never queried, so
+// the relay knows nothing about what it holds and must not claim "finish".
+func TestDoReq_EOSENoHintWhenLimitZero(t *testing.T) {
+	srv := startTestRelay(t, &testRelay{storage: &slicestore.SliceStore{}})
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"REQ", "live", map[string]interface{}{
+		"kinds": []int{1},
+		"limit": 0,
+	}})
+
+	_, hints := recvEOSE(t, conn)
+	if hints != nil {
+		t.Errorf("expected no hint for limit-zero filter, got %v", hints)
+	}
+}
+
+// TestDoReq_EOSEMoreHintIgnoresSkippedEvents: events past the limit that
+// skipEventFunc would drop are not events the client could ever fetch, so they
+// must not be reported as "more".
+func TestDoReq_EOSEMoreHintIgnoresSkippedEvents(t *testing.T) {
+	sk := nostr.GeneratePrivateKey()
+	st := &testStorage{
+		queryEvents: func(_ context.Context, _ nostr.Filter) (chan *nostr.Event, error) {
+			// ignore the limit: one deliverable event followed by two the
+			// relay is configured to drop
+			ch := make(chan *nostr.Event, 3)
+			keep := signedEvent(sk, 1, "keep", nostr.Tags{})
+			ch <- &keep
+			for i := 0; i < 2; i++ {
+				evt := signedEvent(sk, 1, "drop", nostr.Tags{})
+				ch <- &evt
+			}
+			close(ch)
+			return ch, nil
+		},
+	}
+	srv := startTestRelayWithOptions(t, &testRelay{storage: st},
+		WithSkipEventFunc(func(evt *nostr.Event) bool { return evt.Content == "drop" }))
+	defer srv.Shutdown(context.TODO())
+
+	conn := dialWS(t, srv.Addr)
+	sendJSON(t, conn, []interface{}{"REQ", "sub1", nostr.Filter{Kinds: []int{1}, Limit: 1}})
+
+	typ, _ := recvMessage(t, conn)
+	if typ != "EVENT" {
+		t.Fatalf("expected EVENT, got %s", typ)
+	}
+	_, hints := recvEOSE(t, conn)
+	for _, h := range hints {
+		if h == "more" {
+			t.Errorf("skipped events must not be reported as more, got %v", hints)
+		}
+	}
+}
+
+// TestDoReq_EOSEAdvertisedInNIP11: relays implementing NIP-67 should list 67.
+func TestDoReq_NIP67AdvertisedInNIP11(t *testing.T) {
+	srv := startTestRelay(t, &testRelay{storage: &slicestore.SliceStore{}})
+	defer srv.Shutdown(context.TODO())
+
+	req, _ := http.NewRequest(http.MethodGet, "http://"+srv.Addr+"/", nil)
+	req.Header.Set("Accept", "application/nostr+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("http: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var info struct {
+		SupportedNIPs []float64 `json:"supported_nips"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, n := range info.SupportedNIPs {
+		if n == 67 {
+			return
+		}
+	}
+	t.Errorf("NIP-67 not advertised, got %v", info.SupportedNIPs)
+}

@@ -233,6 +233,14 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 		}
 	}
 
+	// NIP-67: track whether we can give the client a definitive completeness
+	// hint on the EOSE. We only claim "finish" when every filter was provably
+	// exhausted, and "more" when at least one filter provably had extra events.
+	// When a filter stops exactly at its limit it is ambiguous (the storage may
+	// have capped the query), so we stay silent -- absence is not definitive.
+	anyMore := false
+	allFinished := len(filters) > 0
+
 	for _, filter := range filters {
 		if ctx.Err() != nil {
 			return ""
@@ -248,6 +256,9 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			return ""
 		}
 		if filter.LimitZero {
+			// the client asked for no stored events, so we never looked; we
+			// have no idea whether the relay holds matching ones
+			allFinished = false
 			continue
 		}
 
@@ -257,6 +268,7 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				return ""
 			}
 			s.Log.Errorf("store: %v", err)
+			allFinished = false
 			continue
 		}
 
@@ -265,6 +277,8 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 			filter.Limit = 9999999999
 		}
 		i := 0
+		seen := 0
+		more := false
 		if events != nil {
 		readEvents:
 			for {
@@ -281,9 +295,16 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				if ctx.Err() != nil {
 					return ""
 				}
+				seen++
 				// Keep draining after the limit, in case storage returns extra
 				// events, but let cancellation stop an unfinished stream.
 				if i >= filter.Limit {
+					// NIP-67: an event we are not going to send proves the
+					// relay holds more than it delivered. Events the relay
+					// would drop anyway are not "more" from the client's side.
+					if s.options.skipEventFunc == nil || !s.options.skipEventFunc(event) {
+						more = true
+					}
 					continue
 				}
 				if s.options.skipEventFunc != nil && s.options.skipEventFunc(event) {
@@ -295,12 +316,33 @@ func (s *Server) doReq(ctx context.Context, ws *WebSocket, request []json.RawMes
 				i++
 			}
 		}
+
+		// NIP-67 completeness bookkeeping for this filter:
+		//   more                 -> definitely more events than we sent
+		//   seen == filter.Limit -> ambiguous, the storage may have capped at the limit
+		//   otherwise            -> the channel was drained, so we sent everything
+		if more {
+			anyMore = true
+		}
+		if more || seen == filter.Limit {
+			allFinished = false
+		}
 	}
 
 	if ctx.Err() != nil {
 		return ""
 	}
-	if err := ws.WriteJSON(nostr.EOSEEnvelope(id)); err != nil {
+	// TODO: nostr.EOSEEnvelope is a bare string and can't carry the NIP-67
+	// hints, so we hand-build the envelope here. Once go-nostr grows a Hints
+	// field on EOSEEnvelope, switch this back to writing the typed envelope.
+	var eose any = nostr.EOSEEnvelope(id)
+	switch {
+	case anyMore:
+		eose = []any{"EOSE", id, []string{"more"}}
+	case allFinished:
+		eose = []any{"EOSE", id, []string{"finish"}}
+	}
+	if err := ws.WriteJSON(eose); err != nil {
 		return ""
 	}
 	s.registerRequest(ws, id, req, filters)
@@ -561,7 +603,7 @@ func (s *Server) HandleNIP11(w http.ResponseWriter, r *http.Request) {
 	if ifmer, ok := s.relay.(Informationer); ok {
 		info = ifmer.GetNIP11InformationDocument()
 	} else {
-		supportedNIPs := []any{9, 11, 12, 15, 16, 20, 33}
+		supportedNIPs := []any{9, 11, 12, 15, 16, 20, 33, 67}
 		if _, ok := s.relay.(Auther); ok {
 			// NIP-42 authentication gates private direct messages and
 			// gift-wrapped events, which relayer handles for Auther relays.
